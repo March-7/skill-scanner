@@ -1543,6 +1543,7 @@ class SkillScanner:
 
         # Keep track of loaded skills for cross-skill analysis
         loaded_skills: list[Skill] = []
+        manifest_coverage: dict[Path, set[Path]] = {}
 
         for skill_dir in skill_dirs:
             try:
@@ -1551,8 +1552,28 @@ class SkillScanner:
                     lenient=lenient,
                     skill_file=skill_file,
                 )
+                if recursive and lenient:
+                    skill_root = skill.directory.resolve()
+                    skill_files = {file.path for file in skill.files}
+                    if skill.load_metadata.get("synthetic_instruction_body") and any(
+                        skill.skill_md_path in manifest_coverage[parent] and skill_files <= manifest_coverage[parent]
+                        for parent in skill_root.parents
+                        if parent in manifest_coverage
+                    ):
+                        # Only suppress candidates actually covered by a loaded
+                        # manifest-backed skill; rejected parents and paths the
+                        # loader excludes must not hide independently found text.
+                        continue
                 result = self._scan_single_skill(skill, skill_dir, load_telemetry=load_telemetry)
                 report.add_scan_result(result)
+
+                if (
+                    recursive
+                    and lenient
+                    and not skill.load_metadata.get("synthetic_instruction_body")
+                    and not result.analyzers_failed
+                ):
+                    manifest_coverage[skill_root] = skill_files
 
                 if check_overlap and skill.manifest_complete:
                     loaded_skills.append(skill)
