@@ -19,8 +19,7 @@ from pathlib import Path
 import pytest
 
 from skill_scanner.core.analyzers.base import BaseAnalyzer
-from skill_scanner.core.analyzers.static import StaticAnalyzer
-from skill_scanner.core.models import Finding, Severity, Skill, ThreatCategory
+from skill_scanner.core.models import Finding, Skill
 from skill_scanner.core.scanner import SkillScanner
 
 
@@ -62,7 +61,7 @@ def symlink(link: Path, target: Path) -> None:
         pytest.skip("directory symlinks are unavailable")
 
 
-def test_lenient_descendants_keep_file_coverage_without_cross_skill_findings(recording_scanner, tmp_path):
+def test_lenient_skips_markdown_descendants_of_a_manifest_skill(recording_scanner, tmp_path):
     scanner, analyzer = recording_scanner
     parent = tmp_path / "weather"
     write_skill(parent)
@@ -73,15 +72,10 @@ def test_lenient_descendants_keep_file_coverage_without_cross_skill_findings(rec
 
     report = scanner.scan_directory(tmp_path, recursive=True, lenient=True, check_overlap=True)
 
-    assert {s.directory for s in analyzer.skills} == {
-        parent,
-        parent / "references",
-        parent / "prompts",
-        parent / "resources" / "US",
-    }
+    assert [s.directory for s in analyzer.skills] == [parent]
     assert {f.path for f in analyzer.skills[0].files} == expected_files
-    assert sum(f.path == guide for s in analyzer.skills for f in s.files) == 2
-    assert len(report.scan_results) == 4
+    assert guide in expected_files
+    assert len(report.scan_results) == 1
     assert not report.cross_skill_findings
     assert not report.skills_skipped
 
@@ -95,7 +89,7 @@ def test_lenient_keeps_independent_markdown_directory(recording_scanner, tmp_pat
 
     scanner.scan_directory(tmp_path, recursive=True, lenient=True)
 
-    assert {s.directory for s in analyzer.skills} == {parent, parent / "references", command.parent}
+    assert {s.directory for s in analyzer.skills} == {parent, command.parent}
     assert command in {f.path for s in analyzer.skills for f in s.files}
 
 
@@ -109,7 +103,7 @@ def test_lenient_keeps_nested_manifest_skill(recording_scanner, tmp_path):
 
     report = scanner.scan_directory(tmp_path, recursive=True, lenient=True, check_overlap=True)
 
-    assert {s.directory for s in analyzer.skills} == {parent, nested, nested / "references"}
+    assert {s.directory for s in analyzer.skills} == {parent, nested}
     assert any(f.rule_id == "TRIGGER_OVERLAP_RISK" for f in report.cross_skill_findings)
 
 
@@ -125,7 +119,7 @@ def test_custom_manifest_keeps_nested_skills(recording_scanner, tmp_path):
     assert {s.directory for s in analyzer.skills} == {parent, nested}
 
 
-def test_lenient_keeps_markdown_outside_manifest_root(recording_scanner, tmp_path):
+def test_lenient_skips_the_folder_that_contains_a_manifest_skill(recording_scanner, tmp_path):
     scanner, analyzer = recording_scanner
     parent = tmp_path / "weather"
     write_skill(parent)
@@ -134,8 +128,8 @@ def test_lenient_keeps_markdown_outside_manifest_root(recording_scanner, tmp_pat
 
     scanner.scan_directory(tmp_path, recursive=True, lenient=True)
 
-    assert {s.directory for s in analyzer.skills} == {parent, parent / "references", tmp_path}
-    assert changelog in {f.path for s in analyzer.skills for f in s.files}
+    assert [s.directory for s in analyzer.skills] == [parent]
+    assert changelog not in {f.path for s in analyzer.skills for f in s.files}
 
 
 def test_rejected_parent_does_not_hide_markdown_descendant(recording_scanner, tmp_path):
@@ -237,68 +231,54 @@ def test_symlinked_manifest_and_cycle_keep_coverage(recording_scanner, tmp_path)
     assert guide in {f.path for s in analyzer.skills for f in s.files}
 
 
-@pytest.mark.parametrize("markdown_count", [1, 2])
-@pytest.mark.parametrize("check_overlap", [False, True])
-def test_static_body_check_receives_synthetic_descendant(tmp_path, monkeypatch, markdown_count, check_overlap):
-    """Loaded files do not substitute for the static check's body input."""
-    parent = tmp_path / "weather"
-    write_skill(parent)
-    guide = parent / "references" / "guide.md"
-    write_markdown(guide)
-    guide.write_text("# Guide\nUse metric units for the local temperature table.\n")
-    if markdown_count == 2:
-        write_markdown(parent / "references" / "notes.md")
-
-    from skill_scanner.core.analyzers import static as static_module
-
-    original = static_module.check_active_remote_execution
-    observed = {}
-
-    def observe_body(skill):
-        observed[skill.directory] = skill.instruction_body
-        return original(skill)
-
-    monkeypatch.setattr(static_module, "check_active_remote_execution", observe_body)
-    with SkillScanner(analyzers=[StaticAnalyzer()], cel_rules=[]) as scanner:
-        child = scanner.loader.load_skill(guide.parent, lenient=True)
-        report = scanner.scan_directory(tmp_path, recursive=True, lenient=True, check_overlap=check_overlap)
-
-    assert "Use metric units" not in observed[parent]
-    assert observed[guide.parent] == child.instruction_body
-    assert len(report.scan_results) == 2
-    assert not report.cross_skill_findings
+def _issue_234_tree(root: Path) -> Path:
+    """The reproduction tree from issue #234: one real skill inside a plugin."""
+    plugin = root / "my-plugin"
+    skill = plugin / "skills" / "demo-skill"
+    for sub in ("references", "prompts", "resources/US", "scripts"):
+        (skill / sub).mkdir(parents=True)
+    (plugin / "CHANGELOG.md").write_text("# Changelog\n\n## 1.0.0\n- Initial release.\n")
+    (skill / "SKILL.md").write_text(
+        "---\nname: demo-skill\ndescription: Demo skill used to reproduce lenient discovery behaviour.\n---\n\n"
+        "# Demo skill\n\nRead `references/guide.md` and follow `prompts/pipeline.md`.\n"
+    )
+    (skill / "references" / "guide.md").write_text(
+        "# Guide\n\nLook the company up at https://registry.example-gov.test/search before continuing.\n"
+    )
+    (skill / "prompts" / "pipeline.md").write_text(
+        "# Pipeline\n\n```bash\nout=$(python scripts/ingest.py)\necho $out | python scripts/route.py\n```\n"
+    )
+    (skill / "resources" / "US" / "notes.md").write_text("# Notes\n\nRegion notes.\n")
+    for name in ("ingest.py", "route.py"):
+        (skill / "scripts" / name).write_text('print("ok")\n')
+    return plugin
 
 
-def test_body_only_custom_analyzer_keeps_its_finding(tmp_path):
-    """A benign marker demonstrates the contract without executing a payload."""
-    parent = tmp_path / "weather"
-    write_skill(parent)
-    guide = write_markdown(parent / "references" / "guide.md")
-    guide.write_text("# Guide\nUse metric units for the local temperature table.\n")
+def test_issue_234_lenient_matches_strict_discovery(tmp_path):
+    from skill_scanner.core.analyzer_factory import build_analyzers
+    from skill_scanner.core.scan_policy import ScanPolicy
 
-    class BodyMarkerAnalyzer(BaseAnalyzer):
-        def __init__(self):
-            super().__init__("body_marker")
+    plugin = _issue_234_tree(tmp_path)
+    policy = ScanPolicy.default()
 
-        def analyze(self, skill):
-            if "Use metric units" not in skill.instruction_body:
-                return []
-            return [
-                Finding(
-                    id="body-marker",
-                    rule_id="LOCAL_BODY_MARKER",
-                    category=ThreatCategory.SOCIAL_ENGINEERING,
-                    severity=Severity.INFO,
-                    title="Benign body marker observed",
-                    description="Records receipt of a harmless unit-test input.",
-                    file_path=skill.skill_md_path.name,
-                    analyzer=self.get_name(),
-                )
-            ]
+    def scan(lenient: bool):
+        analyzers = build_analyzers(policy, use_behavioral=True)
+        with SkillScanner(analyzers=analyzers, policy=policy) as scanner:
+            return scanner.scan_directory(plugin, recursive=True, check_overlap=True, lenient=lenient)
 
-    with SkillScanner(analyzers=[BodyMarkerAnalyzer()], cel_rules=[]) as scanner:
-        report = scanner.scan_directory(tmp_path, recursive=True, lenient=True, check_overlap=True)
+    strict, lenient = scan(False), scan(True)
 
-    assert len(report.scan_results) == 2
-    assert [f.rule_id for r in report.scan_results for f in r.findings] == ["LOCAL_BODY_MARKER"]
-    assert not report.cross_skill_findings
+    def keys(report):
+        return sorted(
+            (r.skill_name, f.rule_id, f.file_path, f.line_number) for r in report.scan_results for f in r.findings
+        )
+
+    assert [r.skill_name for r in lenient.scan_results] == ["demo-skill"]
+    assert keys(lenient) == keys(strict)
+    assert len(keys(lenient)) == len(set(keys(lenient)))
+    assert not lenient.cross_skill_findings
+    skill_dir = plugin / "skills" / "demo-skill"
+    for result in lenient.scan_results:
+        for finding in result.findings:
+            if finding.file_path:
+                assert (skill_dir / finding.file_path).exists(), finding.file_path
