@@ -1521,7 +1521,9 @@ class SkillScanner:
         Args:
             skills_directory: Directory containing skill packages
             recursive: If True, search recursively for SKILL.md files
-            check_overlap: If True, check for description overlap between skills
+            check_overlap: If True, check for description overlap between skills.
+                Recursive lenient scans exclude covered synthetic descendants
+                from cross-skill comparisons, but still analyze each candidate.
             lenient: Tolerate malformed YAML / missing fields in skills.
                 When True, directories containing ``.md`` files (but no
                 ``SKILL.md``) are also discovered as candidate skills.
@@ -1544,6 +1546,7 @@ class SkillScanner:
         # Keep track of loaded skills for cross-skill analysis
         loaded_skills: list[Skill] = []
         manifest_coverage: dict[Path, set[Path]] = {}
+        track_manifest_coverage = recursive and lenient and check_overlap
 
         for skill_dir in skill_dirs:
             try:
@@ -1552,30 +1555,28 @@ class SkillScanner:
                     lenient=lenient,
                     skill_file=skill_file,
                 )
-                if recursive and lenient:
+                covered_descendant = False
+                if track_manifest_coverage:
                     skill_root = skill.directory.resolve()
                     skill_files = {file.path for file in skill.files}
-                    if skill.load_metadata.get("synthetic_instruction_body") and any(
+                    covered_descendant = bool(skill.load_metadata.get("synthetic_instruction_body")) and any(
                         skill.skill_md_path in manifest_coverage[parent] and skill_files <= manifest_coverage[parent]
                         for parent in skill_root.parents
                         if parent in manifest_coverage
-                    ):
-                        # Only suppress candidates actually covered by a loaded
-                        # manifest-backed skill; rejected parents and paths the
-                        # loader excludes must not hide independently found text.
-                        continue
+                    )
+                # File coverage establishes ownership for cross-skill checks,
+                # not equivalence of instruction bodies or analyzer results.
                 result = self._scan_single_skill(skill, skill_dir, load_telemetry=load_telemetry)
                 report.add_scan_result(result)
 
                 if (
-                    recursive
-                    and lenient
+                    track_manifest_coverage
                     and not skill.load_metadata.get("synthetic_instruction_body")
                     and not result.analyzers_failed
                 ):
                     manifest_coverage[skill_root] = skill_files
 
-                if check_overlap and skill.manifest_complete:
+                if check_overlap and skill.manifest_complete and not covered_descendant:
                     loaded_skills.append(skill)
 
             except _SkillMetadataSizeRejection as rejection:

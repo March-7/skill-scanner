@@ -19,7 +19,8 @@ from pathlib import Path
 import pytest
 
 from skill_scanner.core.analyzers.base import BaseAnalyzer
-from skill_scanner.core.models import Finding, Skill
+from skill_scanner.core.analyzers.static import StaticAnalyzer
+from skill_scanner.core.models import Finding, Severity, Skill, ThreatCategory
 from skill_scanner.core.scanner import SkillScanner
 
 
@@ -72,10 +73,15 @@ def test_lenient_descendants_keep_file_coverage_without_cross_skill_findings(rec
 
     report = scanner.scan_directory(tmp_path, recursive=True, lenient=True, check_overlap=True)
 
-    assert [s.directory for s in analyzer.skills] == [parent]
+    assert {s.directory for s in analyzer.skills} == {
+        parent,
+        parent / "references",
+        parent / "prompts",
+        parent / "resources" / "US",
+    }
     assert {f.path for f in analyzer.skills[0].files} == expected_files
-    assert sum(f.path == guide for s in analyzer.skills for f in s.files) == 1
-    assert len(report.scan_results) == 1
+    assert sum(f.path == guide for s in analyzer.skills for f in s.files) == 2
+    assert len(report.scan_results) == 4
     assert not report.cross_skill_findings
     assert not report.skills_skipped
 
@@ -89,7 +95,7 @@ def test_lenient_keeps_independent_markdown_directory(recording_scanner, tmp_pat
 
     scanner.scan_directory(tmp_path, recursive=True, lenient=True)
 
-    assert {s.directory for s in analyzer.skills} == {parent, command.parent}
+    assert {s.directory for s in analyzer.skills} == {parent, parent / "references", command.parent}
     assert command in {f.path for s in analyzer.skills for f in s.files}
 
 
@@ -101,9 +107,10 @@ def test_lenient_keeps_nested_manifest_skill(recording_scanner, tmp_path):
     write_skill(nested)
     write_markdown(nested / "references" / "guide.md")
 
-    scanner.scan_directory(tmp_path, recursive=True, lenient=True)
+    report = scanner.scan_directory(tmp_path, recursive=True, lenient=True, check_overlap=True)
 
-    assert {s.directory for s in analyzer.skills} == {parent, nested}
+    assert {s.directory for s in analyzer.skills} == {parent, nested, nested / "references"}
+    assert any(f.rule_id == "TRIGGER_OVERLAP_RISK" for f in report.cross_skill_findings)
 
 
 def test_custom_manifest_keeps_nested_skills(recording_scanner, tmp_path):
@@ -127,7 +134,7 @@ def test_lenient_keeps_markdown_outside_manifest_root(recording_scanner, tmp_pat
 
     scanner.scan_directory(tmp_path, recursive=True, lenient=True)
 
-    assert {s.directory for s in analyzer.skills} == {parent, tmp_path}
+    assert {s.directory for s in analyzer.skills} == {parent, parent / "references", tmp_path}
     assert changelog in {f.path for s in analyzer.skills for f in s.files}
 
 
@@ -228,3 +235,70 @@ def test_symlinked_manifest_and_cycle_keep_coverage(recording_scanner, tmp_path)
 
     assert [s.directory.resolve() for s in analyzer.skills] == [parent]
     assert guide in {f.path for s in analyzer.skills for f in s.files}
+
+
+@pytest.mark.parametrize("markdown_count", [1, 2])
+@pytest.mark.parametrize("check_overlap", [False, True])
+def test_static_body_check_receives_synthetic_descendant(tmp_path, monkeypatch, markdown_count, check_overlap):
+    """Loaded files do not substitute for the static check's body input."""
+    parent = tmp_path / "weather"
+    write_skill(parent)
+    guide = parent / "references" / "guide.md"
+    write_markdown(guide)
+    guide.write_text("# Guide\nUse metric units for the local temperature table.\n")
+    if markdown_count == 2:
+        write_markdown(parent / "references" / "notes.md")
+
+    from skill_scanner.core.analyzers import static as static_module
+
+    original = static_module.check_active_remote_execution
+    observed = {}
+
+    def observe_body(skill):
+        observed[skill.directory] = skill.instruction_body
+        return original(skill)
+
+    monkeypatch.setattr(static_module, "check_active_remote_execution", observe_body)
+    with SkillScanner(analyzers=[StaticAnalyzer()], cel_rules=[]) as scanner:
+        child = scanner.loader.load_skill(guide.parent, lenient=True)
+        report = scanner.scan_directory(tmp_path, recursive=True, lenient=True, check_overlap=check_overlap)
+
+    assert "Use metric units" not in observed[parent]
+    assert observed[guide.parent] == child.instruction_body
+    assert len(report.scan_results) == 2
+    assert not report.cross_skill_findings
+
+
+def test_body_only_custom_analyzer_keeps_its_finding(tmp_path):
+    """A benign marker demonstrates the contract without executing a payload."""
+    parent = tmp_path / "weather"
+    write_skill(parent)
+    guide = write_markdown(parent / "references" / "guide.md")
+    guide.write_text("# Guide\nUse metric units for the local temperature table.\n")
+
+    class BodyMarkerAnalyzer(BaseAnalyzer):
+        def __init__(self):
+            super().__init__("body_marker")
+
+        def analyze(self, skill):
+            if "Use metric units" not in skill.instruction_body:
+                return []
+            return [
+                Finding(
+                    id="body-marker",
+                    rule_id="LOCAL_BODY_MARKER",
+                    category=ThreatCategory.SOCIAL_ENGINEERING,
+                    severity=Severity.INFO,
+                    title="Benign body marker observed",
+                    description="Records receipt of a harmless unit-test input.",
+                    file_path=skill.skill_md_path.name,
+                    analyzer=self.get_name(),
+                )
+            ]
+
+    with SkillScanner(analyzers=[BodyMarkerAnalyzer()], cel_rules=[]) as scanner:
+        report = scanner.scan_directory(tmp_path, recursive=True, lenient=True, check_overlap=True)
+
+    assert len(report.scan_results) == 2
+    assert [f.rule_id for r in report.scan_results for f in r.findings] == ["LOCAL_BODY_MARKER"]
+    assert not report.cross_skill_findings
